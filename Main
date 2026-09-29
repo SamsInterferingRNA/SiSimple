@@ -1,0 +1,513 @@
+import re
+import sys
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import requests
+from Bio.Blast import NCBIWWW, NCBIXML
+
+#Ensembl setting and parameters
+
+ENSEMBL = "https://rest.ensembl.org"
+SPECIES = "human"
+HTTP_TIMEOUT = 30
+MIN_DIST_FROM_START = 75
+MIN_MAF = 0.01
+SEED_POSITIONS = range(2, 9)
+OFFTARGET_IDENTITY = 0.78
+EXCLUDE_PREDICTED = True
+MAX_REPORTED_HITS = 5
+
+#Results classes
+
+@dataclass
+class Check:
+    name: str
+    passed: Optional[bool]
+    detail: str
+    weight: int = 1
+
+#Sequence translator
+
+_COMP = str.maketrans("ACGT", "TGCA")
+
+
+def clean_seq(seq: str) -> str:
+    return re.sub(r"\s+", "", seq).upper().replace("U", "T")
+
+
+def revcomp(seq: str) -> str:
+    return seq.translate(_COMP)[::-1]
+
+
+def validate_seq(seq: str, label: str) -> None:
+    if not seq or not re.fullmatch(r"[ACGT]+", seq):
+        raise ValueError(f"{label} must contain only A, C, G, T/U.")
+
+#Ensembl REST
+
+class EnsemblError(Exception):
+    pass
+
+def _ensembl_request(method: str, path: str, **kwargs):
+    headers = {"Accept": "application/json"}
+    if method == "POST":
+        headers["Content-Type"] = "application/json"
+    url = ENSEMBL + path
+    last = "no response"
+    for attempt in range(4):
+        try:
+            r = requests.request(method, url, headers=headers,
+                                 timeout=HTTP_TIMEOUT, **kwargs)
+        except requests.RequestException as exc:
+            last = str(exc)
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 429:
+            last = "rate limited (HTTP 429)"
+            time.sleep(float(r.headers.get("Retry-After", 1)))
+            continue
+        if r.status_code >= 500:
+            last = f"HTTP {r.status_code} (Ensembl server error)"
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code != 200:
+            body = r.text[:200].replace("\n", " ")
+            raise EnsemblError(f"{method} {path} -> HTTP {r.status_code}: {body}")
+        return r.json()
+    raise EnsemblError(f"{method} {path}: {last} after 4 attempts. "
+                       "Check https://rest.ensembl.org is reachable and try again later.")
+
+def ensembl_get(path: str, params: Optional[dict] = None):
+    return _ensembl_request("GET", path, params=params)
+
+def ensembl_post(path: str, payload: dict):
+    return _ensembl_request("POST", path, json=payload)
+
+def fetch_transcript(transcript: str):
+    info = ensembl_get(f"/lookup/id/{transcript}")
+    biotype = info.get("biotype", "unknown")
+    cdna = ensembl_get(f"/sequence/id/{transcript}", {"type": "cdna"})["seq"].upper()
+
+    cds = None
+    if biotype == "protein_coding":
+        # Errors here are real failures, so let them propagate.
+        cds = ensembl_get(f"/sequence/id/{transcript}", {"type": "cds"})["seq"].upper()
+    else:
+        try:
+            cds = ensembl_get(f"/sequence/id/{transcript}", {"type": "cds"})["seq"].upper()
+        except EnsemblError:
+            cds = None
+    return cdna, cds, biotype
+
+
+
+def map_to_genome(transcript: str, start1: int, end1: int) -> list[dict]:
+
+    data = ensembl_get(f"/map/cdna/{transcript}/{start1}..{end1}",
+                       {"include_original_region": 1})
+    segments, cum = [], 0
+    for m in data.get("mappings", []):
+        mapped = m.get("mapped", m)
+        if "start" not in mapped:
+            continue
+        orig = m.get("original")
+        length = mapped["end"] - mapped["start"] + 1
+        tx_start = orig["start"] if orig and "start" in orig else start1 + cum
+        segments.append({
+            "chrom": mapped["seq_region_name"],
+            "g_start": mapped["start"],
+            "g_end": mapped["end"],
+            "strand": mapped.get("strand", 1),
+            "tx_start": tx_start,
+        })
+        cum += length
+    if not segments:
+        raise EnsemblError("cDNA-to-genome mapping returned no segments")
+    return segments
+
+#Ensembl Checks
+
+ENSEMBL_CHECKS = [("Target located in transcript", 0),
+                  ("Distance from start codon", 1),
+                  ("Target region", 1),
+                  ("Common SNP/variant overlap", 1)]
+
+
+def skipped(reason: str, only=None) -> list[Check]:
+    return [Check(n, None, f"skipped: {reason}", w)
+            for n, w in ENSEMBL_CHECKS if only is None or n in only]
+
+
+def location_checks(cdna, cds, biotype, position, length, n_segments):
+
+    names = ["Distance from start codon", "Target region"]
+    if cds is None:
+        return skipped(f"no annotated CDS (biotype: {biotype})", names)
+    cds0 = cdna.find(cds)
+    if cds0 == -1:
+        return skipped("could not place the CDS within the cDNA", names)
+
+    cds_end0 = cds0 + len(cds) - 1
+    end0 = position + length - 1
+    offset = position - cds0
+
+    dist = Check("Distance from start codon", offset >= MIN_DIST_FROM_START,
+                 f"target starts {offset} nt from the start codon "
+                 f"(need >= {MIN_DIST_FROM_START}; negative = 5'UTR)")
+
+    if end0 < cds0:
+        region = "5'UTR"
+    elif position > cds_end0:
+        region = "3'UTR"
+    elif position >= cds0 and end0 <= cds_end0:
+        region = "CDS"
+    else:
+        region = "spans a UTR/CDS boundary"
+    detail = (f"target nt {position + 1}-{end0 + 1}; CDS {cds0 + 1}-{cds_end0 + 1}; "
+              f"region: {region}")
+    if n_segments is not None and n_segments > 1:
+        detail += f"; spans an exon-exon junction ({n_segments} genomic segments)"
+    return [dist, Check("Target region", region == "CDS", detail)]
+
+
+def guide_position(var_start, var_end, seg, target_start1, target_len) -> int:
+
+    if seg["strand"] == 1:
+        off = var_start - seg["g_start"]
+    else:
+        off = seg["g_end"] - var_end
+    tx_pos = seg["tx_start"] + max(off, 0)
+    target_offset = tx_pos - target_start1
+    return min(max(target_len - target_offset, 1), target_len)
+
+
+def check_snps(segments, target_start1, target_len) -> Check:
+    name = "Common SNP/variant overlap"
+    found = {}
+    for seg in segments:
+        region = f"{seg['chrom']}:{seg['g_start']}-{seg['g_end']}"
+        data = ensembl_get(f"/overlap/region/{SPECIES}/{region}", {"feature": "variation"})
+        if not isinstance(data, list):
+            raise EnsemblError("unexpected variation response")
+        for v in data:
+            found.setdefault(v["id"], (v, seg))
+
+    if not found:
+        return Check(name, True, "no known variants overlap the target")
+
+    rs_ids = [i for i in found if i.startswith("rs")]
+    freqs = {}
+    for i in range(0, len(rs_ids), 200):
+        batch = ensembl_post(f"/variation/{SPECIES}", {"ids": rs_ids[i:i + 200]})
+        for vid, info in batch.items():
+            freqs[vid] = info.get("MAF")
+
+    common, unknown, rare = [], 0, 0
+    for vid, (v, seg) in found.items():
+        maf = freqs.get(vid)
+        if maf is None:
+            unknown += 1
+        elif maf >= MIN_MAF:
+            pos = guide_position(v["start"], v["end"], seg, target_start1, target_len)
+            tag = "seed" if pos in SEED_POSITIONS else "non-seed"
+            common.append(f"{vid} (MAF {maf:.3f}, guide pos {pos}, {tag})")
+        else:
+            rare += 1
+
+    detail = (f"{len(found)} variant(s) overlap; {len(common)} common (MAF >= {MIN_MAF}), "
+              f"{rare} rare, {unknown} with unknown frequency")
+    if common:
+        detail += ": " + "; ".join(common)
+    return Check(name, not common, detail)
+
+
+def run_ensembl_checks(transcript: str, site: str, core_site: str = "") -> list[Check]:
+    try:
+        cdna, cds, biotype = fetch_transcript(transcript)
+    except EnsemblError as exc:
+        return skipped(f"Ensembl lookup failed ({exc})")
+
+    position = cdna.find(site)
+    used_core = False
+
+    if position == -1 and core_site and core_site != site:
+        position = cdna.find(core_site)
+        if position != -1:
+            site, used_core = core_site, True
+    length = len(site)
+    if position == -1:
+        return ([Check("Target located in transcript", False,
+                       f"reverse complement of the guide not found in {transcript} cDNA", 0)]
+                + skipped("target not found in transcript",
+                          [n for n, _ in ENSEMBL_CHECKS[1:]]))
+
+    copies = cdna.count(site)
+    located = Check("Target located in transcript", True,
+                    f"found at nt {position + 1}-{position + length}"
+                    + (f" ({copies} copies; first used)" if copies > 1 else "")
+                    + ("; matched on the 19-nt core only (guide 3' overhang is not "
+                       "complementary)" if used_core else ""), 0)
+
+    start1, end1 = position + 1, position + length
+    segments, map_error = None, None
+    try:
+        segments = map_to_genome(transcript, start1, end1)
+    except EnsemblError as exc:
+        map_error = str(exc)
+
+    checks = [located]
+    checks += location_checks(cdna, cds, biotype, position, length,
+                              len(segments) if segments else None)
+
+    if segments is None:
+        checks += skipped(f"genome mapping failed ({map_error})", ["Common SNP/variant overlap"])
+    else:
+        try:
+            checks.append(check_snps(segments, start1, length))
+        except EnsemblError as exc:
+            checks += skipped(f"variant lookup failed ({exc})", ["Common SNP/variant overlap"])
+    return checks
+
+#BLAST checks
+
+def check_offtargets(guide_dna: str, gene: str) -> Check:
+    name = "BLAST off-target screen"
+    length = len(guide_dna)
+    try:
+        handle = NCBIWWW.qblast(
+            "blastn", "refseq_rna", guide_dna,
+            entrez_query="Homo sapiens[Organism]",
+            word_size=7, expect=1000, hitlist_size=100, filter="F",
+            nucl_reward=1, nucl_penalty=-3,
+        )
+        record = NCBIXML.read(handle)
+    except Exception as exc:  # network / NCBI errors
+        return Check(name, None, f"skipped: BLAST failed ({exc})", 2)
+
+    gene_re = re.compile(rf"\({re.escape(gene)}\)", re.IGNORECASE) if gene else None
+    hits = []
+    for aln in record.alignments:
+        title = aln.title
+        if gene_re and gene_re.search(title):
+            continue                                   # the intended target gene
+        if EXCLUDE_PREDICTED and re.search(r"\b(XM|XR)_", title):
+            continue
+        for hsp in aln.hsps:
+            frame = getattr(hsp, "frame", None)
+            if frame and len(frame) == 2 and frame[0] * frame[1] > 0:
+                continue
+            frac = hsp.identities / length
+            if frac >= OFFTARGET_IDENTITY:
+                hits.append((frac, hsp.identities, aln.accession, title))
+
+    if not hits:
+        return Check(name, True, "no significant off-target hits", 2)
+
+    hits.sort(reverse=True)
+    lines = [f"{acc}: {ident}/{length} identical - {re.sub(r'^>', '', t)[:70]}"
+             for _, ident, acc, t in hits[:MAX_REPORTED_HITS]]
+    more = f" (+{len(hits) - MAX_REPORTED_HITS} more)" if len(hits) > MAX_REPORTED_HITS else ""
+    return Check(name, False, f"{len(hits)} potential off-target(s): " + " | ".join(lines) + more, 2)
+
+#RNA fold checks
+
+def check_guide_structure(guide_dna: str) -> Check:
+    name = "Guide secondary structure (RNAfold)"
+    try:
+        import RNA  # ViennaRNA Python bindings
+    except ImportError:
+        return Check(name, None, "skipped: ViennaRNA not installed (pip install ViennaRNA)", 2)
+
+    rna = guide_dna.replace("T", "U")
+    structure, mfe = RNA.fold(rna)
+    paired = [i + 1 for i, ch in enumerate(structure) if ch != "."]
+    seed_paired = [p for p in paired if p in SEED_POSITIONS]
+    detail = f"MFE {mfe:.1f} kcal/mol; {guide_dna.replace('T', 'U')} / {structure}"
+    if paired:
+        detail += f"; paired positions: {paired}"
+        if seed_paired:
+            detail += f" (seed positions paired: {seed_paired})"
+
+    return Check(name, not paired, detail, 2)
+
+
+#Sequence composition checks
+
+CORE_LEN = 19
+GC_RANGE = (36.0, 52.0)
+GC_SEED_MAX = 19.0
+GC_CENTRE_MIN = 52.0
+MAX_GC_RUN = 2
+MAX_AT_RUN = 3
+END_BP = 4
+ASYMMETRY_MIN_DDG = 0.0
+
+WEIGHTS = {5: 1, 6: 1, 7: 2, 8: 1, 10: 1, 11: 1, 12: 1, 13: 1, 14: 1, 15: 1, 16: 1, 17: 1}
+
+_NN = {"AA": -0.93, "TT": -0.93,
+       "AT": -1.10,
+       "TA": -1.33,
+       "CT": -2.08, "AG": -2.08,
+       "CA": -2.11, "TG": -2.11,
+       "GT": -2.24, "AC": -2.24,
+       "GA": -2.35, "TC": -2.35,
+       "CG": -2.36,
+       "GG": -3.26, "CC": -3.26,
+       "GC": -3.42}
+
+
+def sense_core(guide: str) -> str:
+    return revcomp(guide[:CORE_LEN])
+
+def gc_percent(seq: str) -> float:
+    return 100.0 * sum(ch in "GC" for ch in seq) / len(seq)
+
+
+def longest_run(seq: str, letters: str) -> int:
+    best = cur = 0
+    for ch in seq:
+        cur = cur + 1 if ch in letters else 0
+        best = max(best, cur)
+    return best
+
+
+def stack_dg(seq: str) -> float:
+
+    return sum(_NN[seq[i:i + 2]] for i in range(len(seq) - 1))
+
+
+def sequence_checks(guide: str) -> list[Check]:
+    names = {5: "GC content 36-52%",
+             6: "Guide GC profile (pos 2-7 low, 8-18 high)",
+             7: "Duplex asymmetry (guide 5' end less stable)",
+             8: "No long G/C or A/T runs",
+             10: "3' overhanging TT",
+             11: "Weak pairing at guide 5' end",
+             12: "Strong pairing at sense 5' end",
+             13: "A at guide position 6",
+             14: "A at sense positions 3 and 19",
+             15: "No G at sense position 13",
+             16: "No G/C at sense position 19",
+             17: "U at sense position 10"}
+
+    def mk(n, passed, detail):
+        return Check(f"[{n}] {names[n]}", passed, detail, WEIGHTS[n])
+
+    def skip_all(reason):
+        return [Check(f"[{n}] {names[n]}", None, f"skipped: {reason}", WEIGHTS[n])
+                for n in sorted(names)]
+
+    if len(guide) < CORE_LEN:
+        return skip_all(f"guide is shorter than {CORE_LEN} nt")
+
+    core = guide[:CORE_LEN]
+    sense = sense_core(guide)
+    checks = []
+
+    gc = gc_percent(core)
+    checks.append(mk(5, GC_RANGE[0] <= gc <= GC_RANGE[1],
+                     f"GC = {gc:.1f}% (need {GC_RANGE[0]:.0f}-{GC_RANGE[1]:.0f}%)"))
+
+    seed_gc = gc_percent(guide[1:7])
+    centre_gc = gc_percent(guide[7:18])
+    checks.append(mk(6, seed_gc <= GC_SEED_MAX and centre_gc >= GC_CENTRE_MIN,
+                     f"GC pos 2-7 = {seed_gc:.1f}% (need <= {GC_SEED_MAX:.0f}%); "
+                     f"pos 8-18 = {centre_gc:.1f}% (need >= {GC_CENTRE_MIN:.0f}%)"))
+
+    dg_guide5 = stack_dg(core[:END_BP])
+    dg_sense5 = stack_dg(core[-END_BP:])
+    dg_avg = stack_dg(core) / (CORE_LEN - 1) * (END_BP - 1)
+    ddg = dg_guide5 - dg_sense5
+    checks.append(mk(7, ddg > ASYMMETRY_MIN_DDG,
+                     f"dG guide 5' end = {dg_guide5:.2f}, sense 5' end = {dg_sense5:.2f} kcal/mol; "
+                     f"difference = {ddg:+.2f} (need > {ASYMMETRY_MIN_DDG:.1f})"))
+
+    gc_run = longest_run(core, "GC")
+    at_run = longest_run(core, "AT")
+    checks.append(mk(8, gc_run <= MAX_GC_RUN and at_run <= MAX_AT_RUN,
+                     f"longest G/C run = {gc_run} (need < {MAX_GC_RUN + 1}); "
+                     f"longest A/T run = {at_run} (need < {MAX_AT_RUN + 1})"))
+    if len(guide) >= CORE_LEN + 2:
+        ovh = guide[CORE_LEN:CORE_LEN + 2]
+        checks.append(mk(10, ovh == "TT", f"guide 3' overhang = {ovh.replace('T', 'U')} "
+                                          "(sense overhang can't be checked; assumed to match)"))
+    else:
+        checks.append(mk(10, None, "skipped: guide has no 3' overhang nucleotides"))
+
+
+    checks.append(mk(11, dg_guide5 > dg_avg,
+                     f"guide 5' end dG = {dg_guide5:.2f} vs duplex average {dg_avg:.2f} kcal/mol "
+                     "(weak = less negative)"))
+
+    checks.append(mk(12, dg_sense5 < dg_avg,
+                     f"sense 5' end dG = {dg_sense5:.2f} vs duplex average {dg_avg:.2f} kcal/mol "
+                     "(strong = more negative)"))
+
+    checks.append(mk(13, guide[5] == "A", f"guide position 6 = {guide[5].replace('T', 'U')}"))
+
+    s3, s19 = sense[2], sense[18]
+    checks.append(mk(14, s3 == "A" and s19 == "A",
+                     f"sense position 3 = {s3.replace('T', 'U')}, position 19 = {s19.replace('T', 'U')}"))
+
+    checks.append(mk(15, sense[12] != "G", f"sense position 13 = {sense[12].replace('T', 'U')}"))
+
+    checks.append(mk(16, s19 not in "GC", f"sense position 19 = {s19.replace('T', 'U')}"))
+
+    checks.append(mk(17, sense[9] == "T", f"sense position 10 = {sense[9].replace('T', 'U')}"))
+
+    return checks
+
+
+#Results printing
+
+def print_report(checks: list[Check]) -> None:
+    labels = {True: "PASS", False: "FAIL", None: "SKIP"}
+    print("\n" + "=" * 70)
+    for c in checks:
+        note = "" if c.weight else " (not scored)"
+        print(f"[{labels[c.passed]}] {c.name}{note}\n       {c.detail}")
+    ran = [c for c in checks if c.weight and c.passed is not None]
+    earned = sum(c.weight for c in ran if c.passed)
+    possible = sum(c.weight for c in ran)
+    not_run = sum(c.weight for c in checks if c.weight and c.passed is None)
+    print("=" * 70)
+    print(f"Score: {earned}/{possible}")
+    if not_run:
+        print(f"Warning: {not_run} point(s) of checks were skipped, so the score is incomplete.")
+
+def main() -> None:
+    guide = clean_seq(input("siRNA guide strand (5'->3'): "))
+    try:
+        validate_seq(guide, "Guide strand")
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if not 19 <= len(guide) <= 25:
+        print(f"Note: guide is {len(guide)} nt; siRNA guides are usually 19-23 nt.")
+        
+    site = revcomp(guide)
+    core_site = revcomp(guide[:CORE_LEN])
+
+    user_target = clean_seq(input("Target sequence (optional, Enter to skip): "))
+    if user_target and core_site not in user_target:
+        print("Warning: your target does not contain the reverse complement of the guide. "
+              "Using the guide-derived site instead.")
+
+    gene = input("HGNC/NCBI gene symbol: ").strip()
+    transcript = input("Ensembl transcript ID: ").strip().split(".")[0]
+
+    print(f"\nGuide (DNA):        {guide}"
+          f"\nSense core (DNA):   {sense_core(guide)}  (19 nt, 5'->3')"
+          f"\nTarget site:        {site}")
+
+    checks = run_ensembl_checks(transcript, site, core_site)
+    checks += sequence_checks(guide)
+    print("Running BLAST (this can take a minute or two)...")
+    checks.append(check_offtargets(guide, gene))
+    checks.append(check_guide_structure(guide))
+    print_report(checks)
+
+
+if __name__ == "__main__":
+    main()
