@@ -36,4 +36,4 @@ Code 429: Rate limited
 
 These codes should be reported to you, and the code will bypass the checks and continue the rest of the scoring. 
 
-DISCLAIMER: I do not have a programming background, please inform me of any errors or ways to improve this code, as I would like it to remain open source and "upgradable" as my skills and knowledge improve. One such example is my ongoing crusade to understand Molecular Mechanics Poisson–Boltzmann Surface Area computations, which will hopefully be included soon. Thank you for using Sam's Simple siRNA.
+DISCLAIMER: I do not have a programming background, please inform me of any errors or ways to improve this code, as I would like it to remain open source and "upgradable" as my skills and knowledge improve. One such example is my ongoing crusade to understand Molecular Mechanics Poisson–Boltzmann Surface Area computations, which will hopefully be included soon. Thank you for using SiSimple!! 
